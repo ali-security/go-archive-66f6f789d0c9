@@ -76,7 +76,7 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 		return fmt.Errorf("could not find untar function %q in testUntarFns", untarFn)
 	}
 	if err := untar(dest, reader); err != nil {
-		if !errors.As(err, new(breakoutError)) {
+		if !errors.As(err, new(breakoutError)) && !isPathEscapes(err) {
 			// If untar returns an error unrelated to an archive breakout,
 			// then consider this an unexpected error and abort.
 			return err
@@ -140,6 +140,13 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 	// Since victim/hello was generated with time.Now(), it is safe to assume
 	// that any file whose content matches exactly victim/hello, managed somehow
 	// to access victim/hello.
+	//
+	// Symlinks are intentionally skipped: symlinks are extracted with their
+	// targets preserved verbatim, even when they point outside the root
+	// (the symlink node itself is inside the root), and extraction resolves
+	// any symlink it follows within the root, so any attempted escape is
+	// caught. A symlink whose target resolves outside root does not
+	// constitute a breakout on its own.
 	return filepath.WalkDir(dest, func(path string, info os.DirEntry, err error) error {
 		if info.IsDir() {
 			if err != nil {
@@ -151,6 +158,11 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 		}
 		if err != nil {
 			// skip file if error
+			return nil
+		}
+		// Skip symlinks: their targets may point outside the root, but that
+		// is safe as extraction never follows them outside the root.
+		if info.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 		b, err := os.ReadFile(path)

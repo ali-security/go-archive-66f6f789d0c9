@@ -72,6 +72,13 @@ func (c overlayWhiteoutConverter) ConvertRead(hdr *tar.Header, path string) (boo
 	base := filepath.Base(path)
 	dir := filepath.Dir(path)
 
+	// A whiteout must name an entry inside dir; reject whiteouts that would
+	// refer to dir itself or to its parent.
+	switch base {
+	case WhiteoutPrefix, WhiteoutPrefix + ".", WhiteoutPrefix + "..":
+		return false, fmt.Errorf("invalid whiteout entry %q", hdr.Name)
+	}
+
 	// if a directory is marked as opaque by the AUFS special file, we need to translate that to overlay
 	if base == WhiteoutOpaqueDir {
 		opaqueXattrName := "trusted.overlay.opaque"
@@ -95,7 +102,7 @@ func (c overlayWhiteoutConverter) ConvertRead(hdr *tar.Header, path string) (boo
 		if err := unix.Mknod(originalPath, unix.S_IFCHR, 0); err != nil {
 			return false, fmt.Errorf("failed to mknod('%s', S_IFCHR, 0): %w", originalPath, err)
 		}
-		if err := os.Chown(originalPath, hdr.Uid, hdr.Gid); err != nil {
+		if err := os.Lchown(originalPath, hdr.Uid, hdr.Gid); err != nil {
 			return false, err
 		}
 

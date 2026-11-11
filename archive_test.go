@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moby/sys/user"
 	"github.com/moby/sys/userns"
@@ -585,7 +586,7 @@ func TestTarWithOptions(t *testing.T) {
 func TestTypeXGlobalHeaderDoesNotFail(t *testing.T) {
 	hdr := tar.Header{Typeflag: tar.TypeXGlobalHeader}
 	tmpDir := t.TempDir()
-	err := createTarFile(filepath.Join(tmpDir, "pax_global_header"), tmpDir, &hdr, nil, nil)
+	err := createTarFile(tmpDir, "pax_global_header", &hdr, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,6 +716,85 @@ func TestUntarInvalidFilenames(t *testing.T) {
 	}
 }
 
+// TestUntarParentTraversalContained verifies that entries whose names traverse
+// above the destination (including a bare "..") are rejected and never write
+// into the destination's parent. Regression test for the "write to the parent
+// of the extraction root" breakout.
+func TestUntarParentTraversalContained(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry string
+	}{
+		{name: "bare parent", entry: ".."},
+		{name: "parent child", entry: "../pwned"},
+		{name: "nested parent", entry: "../../pwned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			dest := filepath.Join(base, "dest")
+			assert.NilError(t, os.Mkdir(dest, 0o755))
+
+			var buf bytes.Buffer
+			tw := tar.NewWriter(&buf)
+			assert.NilError(t, tw.WriteHeader(&tar.Header{
+				Name:     tc.entry,
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+				Size:     int64(len("bad")),
+			}))
+			_, err := tw.Write([]byte("bad"))
+			assert.NilError(t, err)
+			assert.NilError(t, tw.Close())
+
+			// Untar must reject parent-traversal entries; regardless,
+			// nothing may be written above dest.
+			err = Untar(&buf, dest, &TarOptions{NoLchown: true})
+			assert.ErrorContains(t, err, "invalid entry name")
+
+			// dest's parent must still contain only dest.
+			entries, err := os.ReadDir(base)
+			assert.NilError(t, err)
+			assert.Equal(t, len(entries), 1, "unexpected escape into parent: %v", entries)
+			assert.Equal(t, entries[0].Name(), "dest")
+		})
+	}
+}
+
+// TestUntarSiblingPrefixContained verifies that a hardlink whose target is in a
+// sibling directory sharing the destination's path prefix (dest "base/dest",
+// sibling "base/dest-evil") cannot be created. Regression test for the old
+// string-prefix (HasPrefix) containment check, which treated such a sibling
+// as inside the destination.
+func TestUntarSiblingPrefixContained(t *testing.T) {
+	base := t.TempDir()
+	dest := filepath.Join(base, "dest")
+	assert.NilError(t, os.Mkdir(dest, 0o755))
+	// Prefix-sharing sibling with a sentinel file.
+	evil := filepath.Join(base, "dest-evil")
+	assert.NilError(t, os.Mkdir(evil, 0o755))
+
+	assert.NilError(t, os.WriteFile(filepath.Join(evil, "secret"), []byte("secret"), 0o600))
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	// A hardlink whose target resolves to the prefix-sharing sibling. The old
+	// strings.HasPrefix check accepted this because "base/dest-evil/secret"
+	// starts with "base/dest".
+	assert.NilError(t, tw.WriteHeader(&tar.Header{
+		Name:     "grab",
+		Typeflag: tar.TypeLink,
+		Linkname: "../dest-evil/secret",
+		Mode:     0o644,
+	}))
+	assert.NilError(t, tw.Close())
+
+	_ = Untar(&buf, dest, &TarOptions{NoLchown: true}) // may error; we only require containment
+
+	// No hardlink to the sibling's secret may be created inside dest.
+	_, statErr := os.Stat(filepath.Join(dest, "grab"))
+	assert.Check(t, errors.Is(statErr, os.ErrNotExist), "hardlink to prefix-sibling created: %v", statErr)
+}
+
 func TestUntarHardlinkToSymlink(t *testing.T) {
 	skip.If(t, runtime.GOOS != "windows" && os.Getuid() != 0, "skipping test that requires root")
 	for i, headers := range [][]*tar.Header{
@@ -824,6 +904,40 @@ func TestUntarInvalidHardlink(t *testing.T) {
 	}
 }
 
+// TestUntarAbsoluteHardlink verifies that a hardlink whose target is an
+// absolute path (as written by some image builders, e.g. kaniko) is resolved
+// relative to the extraction root, while absolute targets with relative
+// escapes remain rejected (see TestUntarInvalidHardlink).
+func TestUntarAbsoluteHardlink(t *testing.T) {
+	dest := t.TempDir()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	assert.NilError(t, tw.WriteHeader(&tar.Header{
+		Name:     "usr/bin/perlbug",
+		Typeflag: tar.TypeReg,
+		Mode:     0o755,
+		Size:     5,
+	}))
+	_, err := tw.Write([]byte("hello"))
+	assert.NilError(t, err)
+	assert.NilError(t, tw.WriteHeader(&tar.Header{
+		Name:     "usr/bin/perlthanks",
+		Typeflag: tar.TypeLink,
+		Linkname: "/usr/bin/perlbug",
+		Mode:     0o755,
+	}))
+	assert.NilError(t, tw.Close())
+
+	assert.NilError(t, Untar(&buf, dest, &TarOptions{NoLchown: true}))
+
+	fi1, err := os.Stat(filepath.Join(dest, "usr", "bin", "perlbug"))
+	assert.NilError(t, err)
+	fi2, err := os.Stat(filepath.Join(dest, "usr", "bin", "perlthanks"))
+	assert.NilError(t, err)
+	assert.Assert(t, os.SameFile(fi1, fi2), "expected hardlinked files to share an inode")
+}
+
 func TestUntarInvalidSymlink(t *testing.T) {
 	for i, headers := range [][]*tar.Header{
 		{ // try reading victim/hello (../)
@@ -915,6 +1029,456 @@ func TestUntarInvalidSymlink(t *testing.T) {
 		if err := testBreakout("untar", "docker-TestUntarInvalidSymlink", headers); err != nil {
 			t.Fatalf("i=%d. %v", i, err)
 		}
+	}
+}
+
+// TestUntarSymlinkBreakout is a regression test for a tar path-traversal
+// vulnerability: a two-hop symlink chain in a malicious archive can escape
+// the extraction root at runtime while passing the static path checks that
+// guard each entry name and symlink target.  Two hops are needed because a
+// direct out-of-root symlink target is already rejected by a static check in
+// createTarFile; the first hop (go_up -> "..") fools that check for the
+// second hop (escape -> "../victim") by appearing to stay within the root
+// when paths are joined as strings, while the OS resolves go_up at runtime
+// and places escape one level higher than the check assumed.
+func TestUntarSymlinkBreakout(t *testing.T) {
+	tmpdir := t.TempDir()
+	dest := filepath.Join(tmpdir, "dest")
+	victim := filepath.Join(tmpdir, "victim")
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := &bytes.Buffer{}
+	tw := tar.NewWriter(buf)
+	for _, hdr := range []*tar.Header{
+		{Name: "inner", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "inner/go_up", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		{Name: "inner/go_up/escape", Typeflag: tar.TypeSymlink, Linkname: "../victim"},
+		{Name: "inner/go_up/escape/newfile", Typeflag: tar.TypeReg, Mode: 0o644},
+	} {
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = tw.Close()
+
+	// Ignore any extraction error: a breakoutError means the escape was
+	// caught; no error means the write was safely redirected within dest.
+	// NoLchown suppresses the ownership call so the test runs without root.
+	_ = Untar(buf, dest, &TarOptions{NoLchown: true})
+
+	// victim/newfile must not exist; its presence proves a breakout.
+	if _, err := os.Lstat(filepath.Join(victim, "newfile")); err == nil {
+		t.Fatal("archive breakout: newfile was written outside extraction root via symlink chain")
+	}
+}
+
+// TestUntarThroughAbsoluteSymlink verifies that archive extraction follows a
+// pre-existing absolute symlink relative to the extraction root, including
+// when the symlink target or directories following it do not yet exist.
+//
+// Regression test for https://github.com/moby/moby/issues/53258
+func TestUntarThroughAbsoluteSymlink(t *testing.T) {
+	skip.If(t, runtime.GOOS == "windows", "absolute POSIX symlink targets are not absolute paths on Windows")
+	unpackers := []struct {
+		name   string
+		unpack func(dest string, r io.Reader) error
+	}{
+		{
+			name: "Untar",
+			unpack: func(dest string, r io.Reader) error {
+				return Untar(r, dest, &TarOptions{NoLchown: true})
+			},
+		},
+		{
+			name: "UnpackLayer",
+			unpack: func(dest string, r io.Reader) error {
+				_, err := UnpackLayer(dest, r, &TarOptions{NoLchown: true})
+				return err
+			},
+		},
+	}
+
+	for _, unpacker := range unpackers {
+		t.Run(unpacker.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name         string
+				createTarget bool
+			}{
+				{
+					name:         "existing target",
+					createTarget: true,
+				},
+				{
+					name:         "missing target",
+					createTarget: false,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					const (
+						name    = "var/run/existing/non-existing/file"
+						content = "content"
+					)
+
+					dest := t.TempDir()
+					assert.NilError(t, os.Mkdir(filepath.Join(dest, "var"), 0o755))
+					if tc.createTarget {
+						assert.NilError(t, os.MkdirAll(
+							filepath.Join(dest, "run", "existing"),
+							0o755,
+						))
+					}
+					assert.NilError(t, os.Symlink(
+						"/run",
+						filepath.Join(dest, "var", "run"),
+					))
+
+					buf := &bytes.Buffer{}
+					tw := tar.NewWriter(buf)
+					assert.NilError(t, tw.WriteHeader(&tar.Header{
+						Name:     name,
+						Typeflag: tar.TypeReg,
+						Mode:     0o644,
+						Size:     int64(len(content)),
+					}))
+					_, err := io.WriteString(tw, content)
+					assert.NilError(t, err)
+					assert.NilError(t, tw.Close())
+
+					assert.NilError(t, unpacker.unpack(dest, buf))
+
+					actual, err := os.ReadFile(filepath.Join(
+						dest, "run", "existing", "non-existing", "file",
+					))
+					assert.NilError(t, err)
+					assert.DeepEqual(t, actual, []byte(content))
+				})
+			}
+		})
+	}
+}
+
+// A relative symlink must not escape the extraction root merely because path
+// resolution encounters an absolute symlink afterward.
+func TestUnpackRejectsRelativeEscapeBeforeAbsoluteSymlink(t *testing.T) {
+	skip.If(t, runtime.GOOS == "windows", "absolute POSIX symlink targets are not absolute paths on Windows")
+	buf := &bytes.Buffer{}
+	tw := tar.NewWriter(buf)
+	assert.NilError(t, tw.WriteHeader(&tar.Header{
+		Name:     "escape/absolute/file",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+	}))
+	assert.NilError(t, tw.Close())
+
+	unpackers := []struct {
+		name   string
+		unpack func(dest string, r io.Reader) error
+	}{
+		{
+			name: "Unpack",
+			unpack: func(dest string, r io.Reader) error {
+				return Unpack(r, dest, &TarOptions{NoLchown: true})
+			},
+		},
+		{
+			name: "UnpackLayer",
+			unpack: func(dest string, r io.Reader) error {
+				_, err := UnpackLayer(dest, r, &TarOptions{NoLchown: true})
+				return err
+			},
+		},
+	}
+
+	for _, unpacker := range unpackers {
+		t.Run(unpacker.name, func(t *testing.T) {
+			dest := t.TempDir()
+			assert.NilError(t, os.Mkdir(filepath.Join(dest, "target"), 0o755))
+			assert.NilError(t, os.Symlink("..", filepath.Join(dest, "escape")))
+			assert.NilError(t, os.Symlink(
+				"/target",
+				filepath.Join(dest, "absolute"),
+			))
+
+			err := unpacker.unpack(dest, bytes.NewReader(buf.Bytes()))
+			assert.Check(t, isPathEscapes(err), "expected path-escape error, got: %v", err)
+
+			_, err = os.Lstat(filepath.Join(dest, "target", "file"))
+			assert.Check(t, os.IsNotExist(err), "archive wrote through rejected path: %v", err)
+		})
+	}
+}
+
+// Absolute symlinks are common in container root filesystems and may come from
+// a lower layer. Later layers must resolve files and hardlink sources through
+// those symlinks relative to the extraction root, not the host root.
+func TestHardlinkSourceThroughAbsoluteSymlink(t *testing.T) {
+	skip.If(t, runtime.GOOS == "windows", "absolute POSIX symlink targets are not absolute paths on Windows")
+	const content = "content"
+
+	unpackers := []struct {
+		name   string
+		unpack func(io.Reader, string) error
+	}{
+		{
+			name: "Unpack",
+			unpack: func(r io.Reader, dest string) error {
+				return Unpack(r, dest, &TarOptions{NoLchown: true})
+			},
+		},
+		{
+			name: "UnpackLayer",
+			unpack: func(r io.Reader, dest string) error {
+				_, err := UnpackLayer(dest, r, &TarOptions{NoLchown: true})
+				return err
+			},
+		},
+	}
+
+	for _, tc := range unpackers {
+		t.Run(tc.name, func(t *testing.T) {
+			dest := t.TempDir()
+			assert.NilError(t, os.Mkdir(filepath.Join(dest, "var"), 0o755))
+			assert.NilError(t, os.Symlink("/run", filepath.Join(dest, "var", "run")))
+
+			buf := &bytes.Buffer{}
+			tw := tar.NewWriter(buf)
+			assert.NilError(t, tw.WriteHeader(&tar.Header{
+				Name:     "var/run/source",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+				Size:     int64(len(content)),
+			}))
+			_, err := io.WriteString(tw, content)
+			assert.NilError(t, err)
+			assert.NilError(t, tw.WriteHeader(&tar.Header{
+				Name:     "var/run/link",
+				Typeflag: tar.TypeLink,
+				Linkname: "var/run/source",
+				Mode:     0o644,
+			}))
+			assert.NilError(t, tw.Close())
+
+			assert.NilError(t, tc.unpack(buf, dest))
+
+			source := filepath.Join(dest, "run", "source")
+			link := filepath.Join(dest, "run", "link")
+			actual, err := os.ReadFile(link)
+			assert.NilError(t, err)
+			assert.DeepEqual(t, actual, []byte(content))
+
+			sourceInfo, err := os.Stat(source)
+			assert.NilError(t, err)
+			linkInfo, err := os.Stat(link)
+			assert.NilError(t, err)
+			assert.Assert(t, os.SameFile(sourceInfo, linkInfo), "expected hardlinked files to share an inode")
+		})
+	}
+}
+
+// TestUnpackSymlinkBreakoutContained verifies that symlinks introduced by a
+// crafted archive (or already present in the destination) cannot be used to
+// create, overwrite, link, remove, or change the metadata of files outside the
+// extraction root.
+func TestUnpackSymlinkBreakoutContained(t *testing.T) {
+	skip.If(t, runtime.GOOS == "windows", "absolute POSIX symlink targets are not absolute paths on Windows")
+	const victimContent = "victim content"
+	victimTime := time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)
+
+	unpackers := []struct {
+		name   string
+		layer  bool
+		unpack func(dest string, r io.Reader) error
+	}{
+		{
+			name: "Untar",
+			unpack: func(dest string, r io.Reader) error {
+				return Untar(r, dest, &TarOptions{NoLchown: true})
+			},
+		},
+		{
+			name:  "UnpackLayer",
+			layer: true,
+			unpack: func(dest string, r io.Reader) error {
+				_, err := UnpackLayer(dest, r, &TarOptions{NoLchown: true})
+				return err
+			},
+		},
+	}
+
+	// Each scenario receives the absolute path of the victim directory, which
+	// is a sibling of the extraction root.
+	scenarios := []struct {
+		name       string
+		layerOnly  bool
+		preExisted bool // dest/abs is a pre-existing absolute symlink to victim
+		headers    func(victim string) []*tar.Header
+	}{
+		{
+			name: "write through archive absolute symlink",
+			headers: func(victim string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "abs", Typeflag: tar.TypeSymlink, Linkname: victim},
+					{Name: "abs/newfile", Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+		{
+			name: "overwrite through archive absolute symlink",
+			headers: func(victim string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "abs", Typeflag: tar.TypeSymlink, Linkname: victim},
+					{Name: "abs/hello", Typeflag: tar.TypeReg, Mode: 0o777},
+				}
+			},
+		},
+		{
+			name:       "overwrite through pre-existing absolute symlink",
+			preExisted: true,
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "abs/hello", Typeflag: tar.TypeReg, Mode: 0o777},
+				}
+			},
+		},
+		{
+			name: "hardlink through archive absolute symlink",
+			headers: func(victim string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "abs", Typeflag: tar.TypeSymlink, Linkname: victim},
+					{Name: "grab", Typeflag: tar.TypeLink, Linkname: "abs/hello", Mode: 0o777},
+				}
+			},
+		},
+		{
+			name: "write through relative symlink chain",
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "inner", Typeflag: tar.TypeDir, Mode: 0o755},
+					{Name: "inner/go_up", Typeflag: tar.TypeSymlink, Linkname: ".."},
+					{Name: "inner/go_up/escape", Typeflag: tar.TypeSymlink, Linkname: "../victim"},
+					{Name: "inner/go_up/escape/hello", Typeflag: tar.TypeReg, Mode: 0o777},
+				}
+			},
+		},
+		{
+			name: "directory mtime through replaced directory",
+			headers: func(victim string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "dir", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: time.Unix(0, 0)},
+					{Name: "dir", Typeflag: tar.TypeSymlink, Linkname: victim},
+				}
+			},
+		},
+		{
+			name:      "whiteout through relative symlink chain",
+			layerOnly: true,
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "inner", Typeflag: tar.TypeDir, Mode: 0o755},
+					{Name: "inner/go_up", Typeflag: tar.TypeSymlink, Linkname: ".."},
+					{Name: "inner/go_up/escape", Typeflag: tar.TypeSymlink, Linkname: "../victim"},
+					{Name: "inner/go_up/escape/" + WhiteoutPrefix + "hello", Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+		{
+			name:      "opaque whiteout through relative symlink chain",
+			layerOnly: true,
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "inner", Typeflag: tar.TypeDir, Mode: 0o755},
+					{Name: "inner/go_up", Typeflag: tar.TypeSymlink, Linkname: ".."},
+					{Name: "inner/go_up/escape", Typeflag: tar.TypeSymlink, Linkname: ".."},
+					{Name: "inner/go_up/escape/victim/" + WhiteoutOpaqueDir, Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+		{
+			name:      "whiteout of the parent directory",
+			layerOnly: true,
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: WhiteoutPrefix + "..", Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+	}
+
+	for _, unpacker := range unpackers {
+		t.Run(unpacker.name, func(t *testing.T) {
+			for _, sc := range scenarios {
+				if sc.layerOnly && !unpacker.layer {
+					continue
+				}
+				t.Run(sc.name, func(t *testing.T) {
+					base := t.TempDir()
+					dest := filepath.Join(base, "dest")
+					victim := filepath.Join(base, "victim")
+					hello := filepath.Join(victim, "hello")
+					assert.NilError(t, os.Mkdir(dest, 0o755))
+					assert.NilError(t, os.Mkdir(victim, 0o755))
+					assert.NilError(t, os.WriteFile(hello, []byte(victimContent), 0o600))
+					assert.NilError(t, os.Chtimes(victim, victimTime, victimTime))
+					if sc.preExisted {
+						assert.NilError(t, os.Symlink(victim, filepath.Join(dest, "abs")))
+					}
+
+					buf := &bytes.Buffer{}
+					tw := tar.NewWriter(buf)
+					for _, hdr := range sc.headers(victim) {
+						assert.NilError(t, tw.WriteHeader(hdr))
+					}
+					assert.NilError(t, tw.Close())
+
+					// Extraction may fail (the escape was caught) or succeed
+					// (the entry was redirected within dest); either way,
+					// nothing outside dest may be touched.
+					err := unpacker.unpack(dest, buf)
+					t.Logf("unpack error: %v", err)
+
+					_, err = os.Stat(dest)
+					assert.NilError(t, err, "extraction root was removed")
+
+					entries, err := os.ReadDir(victim)
+					assert.NilError(t, err, "victim directory was removed")
+					var names []string
+					for _, e := range entries {
+						names = append(names, e.Name())
+					}
+					assert.DeepEqual(t, names, []string{"hello"})
+
+					fi, err := os.Lstat(hello)
+					assert.NilError(t, err)
+					assert.Check(t, fi.Mode().IsRegular(), "victim file was replaced: %v", fi.Mode())
+					assert.Check(t, is.Equal(fi.Mode().Perm(), os.FileMode(0o600)), "victim file mode was changed")
+					actual, err := os.ReadFile(hello)
+					assert.NilError(t, err)
+					assert.Check(t, is.Equal(string(actual), victimContent), "victim file was modified")
+
+					// No file inside dest may be a hardlink to the victim file.
+					assert.NilError(t, filepath.WalkDir(dest, func(p string, d fs.DirEntry, err error) error {
+						if err != nil || d.IsDir() {
+							return err
+						}
+						dfi, err := os.Lstat(p)
+						if err != nil {
+							return err
+						}
+						assert.Check(t, !os.SameFile(fi, dfi), "victim file was hardlinked into the extraction root as %q", p)
+						return nil
+					}))
+
+					vfi, err := os.Stat(victim)
+					assert.NilError(t, err)
+					assert.Check(t, vfi.ModTime().Equal(victimTime), "victim directory mtime was changed: %v", vfi.ModTime())
+				})
+			}
+		})
 	}
 }
 
